@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Union
 
 from .client import ScihubClient
-from .errors import InvalidDOIError, NotFoundError, ScihubError
+from .errors import InvalidDOIError, NotFoundError, ParseError, ScihubError
 from .models import BatchResult
 from .utils import normalize_doi
 
@@ -102,6 +102,10 @@ class BatchDownloader:
 
         except NotFoundError as exc:
             return BatchResult(doi=doi, status="not_found", error=str(exc))
+        except ParseError as exc:
+            # Deliberately NOT "not_found": the page loaded but we could not
+            # read it. Surfacing this as absent would be a false negative.
+            return BatchResult(doi=doi, status="parse_error", error=str(exc))
         except ScihubError as exc:
             return BatchResult(doi=doi, status="error", error=str(exc))
         except Exception as exc:  # noqa: BLE001 - never let one DOI kill the batch
@@ -158,16 +162,23 @@ class BatchDownloader:
 
 
 def summarize(results: Sequence[BatchResult]) -> dict:
-    """Aggregate counts for a finished batch."""
+    """Aggregate counts for a finished batch.
+
+    ``parse_errors`` is reported separately from ``not_found`` on purpose: the
+    former means "we could not read the page", the latter means "Sci-Hub says
+    it isn't there". Merging them would hide false negatives.
+    """
     total = len(results)
     ok = sum(1 for r in results if r.status == "ok")
     not_found = sum(1 for r in results if r.status == "not_found")
+    parse_errors = sum(1 for r in results if r.status == "parse_error")
     errors = sum(1 for r in results if r.status == "error")
     downloaded_bytes = sum(r.size or 0 for r in results if r.status == "ok")
     return {
         "total": total,
         "ok": ok,
         "not_found": not_found,
+        "parse_errors": parse_errors,
         "errors": errors,
         "downloaded_bytes": downloaded_bytes,
     }

@@ -5,11 +5,14 @@ import responses
 
 from scihub_dl.client import ScihubClient
 from scihub_dl.errors import (
+    BotCheckError,
     ChallengeError,
     DownloadError,
     InvalidDOIError,
     MirrorUnreachableError,
     NotFoundError,
+    ParseError,
+    RedirectLoopError,
 )
 
 from .conftest import make_challenge
@@ -244,3 +247,184 @@ class TestContextManager:
         responses.add(responses.GET, f"{MIRROR}/{DOI}", body=paper_html, status=200)
         with _client() as client:
             assert client.resolve(DOI).pdf_url == PDF_URL
+
+
+# --------------------------------------------------------------------------- #
+# Resilience: redirect loops, bot checks, and per-mirror failover.
+#
+# These cover the failure mode seen live, where sci-hub.ru answered but bounced
+# the same URL until requests' 30-redirect cap tripped. The rules under test:
+#   * a redirect loop must fail fast, not burn 30 hops
+#   * a redirect loop / bot check is a *host* problem -> fail over, never
+#     report the paper as missing
+#   * only positive "not found" evidence may raise NotFoundError
+# --------------------------------------------------------------------------- #
+ALT = "https://sci-hub.st"
+
+BOT_CHECK_HTML = (
+    "<html><head><title>Just a moment...</title></head>"
+    "<body><p>Checking your browser before accessing.</p>"
+    "<p>Please complete the check to continue</p></body></html>"
+)
+
+
+class TestRedirectLoop:
+    @responses.activate
+    def test_redirect_loop_fails_fast_and_does_not_hang(self):
+        """A self-referential 302 must raise quickly, not spin 30 times."""
+        _register_mirror_up(responses)
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI}",
+            status=302,
+            headers={"Location": f"{MIRROR}/{DOI}"},
+        )
+        client = ScihubClient(mirrors=[MIRROR], retries=0, max_redirects=3)
+        with pytest.raises(MirrorUnreachableError):
+            client.resolve(DOI)
+        # Homepage warm-up + at most max_redirects hops - nowhere near 30.
+        assert len(responses.calls) <= 8
+
+    @responses.activate
+    def test_redirect_loop_falls_over_to_healthy_mirror(self, paper_html):
+        """Mirror health is per-host: a bounce on one must not fail the DOI."""
+        responses.add(responses.GET, MIRROR, body="x" * 2000, status=200)
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI}",
+            status=302,
+            headers={"Location": f"{MIRROR}/{DOI}"},
+        )
+        responses.add(responses.GET, ALT, body="y" * 2000, status=200)
+        responses.add(responses.GET, f"{ALT}/{DOI}", body=paper_html, status=200)
+
+        client = ScihubClient(mirrors=[MIRROR, ALT], retries=0, max_redirects=3)
+        paper = client.resolve(DOI)
+
+        assert paper.pdf_url == PDF_URL
+        assert client.active_mirror == ALT
+
+    @responses.activate
+    def test_looping_mirror_is_marked_dead_and_not_retried(self, paper_html):
+        """Once a mirror bounces us, stop paying that cost for later DOIs."""
+        responses.add(responses.GET, MIRROR, body="x" * 2000, status=200)
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI}",
+            status=302,
+            headers={"Location": f"{MIRROR}/{DOI}"},
+        )
+        responses.add(responses.GET, ALT, body="y" * 2000, status=200)
+        responses.add(responses.GET, f"{ALT}/{DOI}", body=paper_html, status=200)
+
+        client = ScihubClient(mirrors=[MIRROR, ALT], retries=0, max_redirects=3)
+        client.resolve(DOI)
+        assert MIRROR in client._dead_mirrors
+        assert MIRROR not in client._candidate_mirrors()
+
+    @responses.activate
+    def test_redirect_loop_never_reported_as_not_found(self):
+        """Regression guard: a bounce is not evidence the paper is absent."""
+        _register_mirror_up(responses)
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI}",
+            status=302,
+            headers={"Location": f"{MIRROR}/{DOI}"},
+        )
+        client = ScihubClient(mirrors=[MIRROR], retries=0, max_redirects=3)
+        with pytest.raises(MirrorUnreachableError):
+            client.resolve(DOI)
+
+
+class TestBotCheck:
+    @responses.activate
+    def test_bot_check_falls_over_to_healthy_mirror(self, paper_html):
+        responses.add(responses.GET, MIRROR, body="x" * 2000, status=200)
+        responses.add(responses.GET, f"{MIRROR}/{DOI}", body=BOT_CHECK_HTML, status=200)
+        responses.add(responses.GET, ALT, body="y" * 2000, status=200)
+        responses.add(responses.GET, f"{ALT}/{DOI}", body=paper_html, status=200)
+
+        client = ScihubClient(mirrors=[MIRROR, ALT], retries=0)
+        assert client.resolve(DOI).pdf_url == PDF_URL
+
+    @responses.activate
+    def test_bot_check_everywhere_is_not_a_not_found(self):
+        """An unclearable gate means 'unknown', never 'absent'."""
+        _register_mirror_up(responses)
+        responses.add(responses.GET, f"{MIRROR}/{DOI}", body=BOT_CHECK_HTML, status=200)
+
+        client = ScihubClient(mirrors=[MIRROR], retries=0)
+        with pytest.raises(MirrorUnreachableError):
+            client.resolve(DOI)
+
+
+class TestNotFoundVsParseError:
+    @responses.activate
+    def test_unparseable_page_raises_parse_error_not_not_found(self):
+        """A page that loads but yields no link is 'we don't know'."""
+        _register_mirror_up(responses)
+        # Long enough not to look like a stub, but with no citation meta tags.
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI}",
+            body="<html><body>" + ("filler " * 5000) + "</body></html>",
+            status=200,
+        )
+        client = ScihubClient(mirrors=[MIRROR], retries=0)
+        with pytest.raises(ParseError):
+            client.resolve(DOI)
+
+    @responses.activate
+    def test_parse_error_message_disclaims_unavailability(self):
+        _register_mirror_up(responses)
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI}",
+            body="<html><body>" + ("filler " * 5000) + "</body></html>",
+            status=200,
+        )
+        client = ScihubClient(mirrors=[MIRROR], retries=0)
+        with pytest.raises(ParseError, match="NOT proof"):
+            client.resolve(DOI)
+
+    @responses.activate
+    def test_explicit_marker_still_raises_not_found(self, not_found_html):
+        """Positive evidence must still produce a clean NotFoundError."""
+        _register_mirror_up(responses)
+        responses.add(responses.GET, f"{MIRROR}/{DOI}", body=not_found_html, status=200)
+        client = ScihubClient(mirrors=[MIRROR], retries=0)
+        with pytest.raises(NotFoundError):
+            client.resolve(DOI)
+
+    @responses.activate
+    def test_second_mirror_can_rescue_a_not_found(self, paper_html, not_found_html):
+        """One mirror saying 'absent' must not end the search."""
+        responses.add(responses.GET, MIRROR, body="x" * 2000, status=200)
+        responses.add(responses.GET, f"{MIRROR}/{DOI}", body=not_found_html, status=200)
+        responses.add(responses.GET, ALT, body="y" * 2000, status=200)
+        responses.add(responses.GET, f"{ALT}/{DOI}", body=paper_html, status=200)
+
+        client = ScihubClient(mirrors=[MIRROR, ALT], retries=0)
+        assert client.resolve(DOI).pdf_url == PDF_URL
+
+
+class TestCaptchaErrorAttribution:
+    @responses.activate
+    def test_captcha_failure_surfaces_as_challenge_error(self, captcha_html):
+        """A cleared host that we can't get past is a ChallengeError,
+        not 'no mirror answered'."""
+        chal, _ = make_challenge()
+        _register_mirror_up(responses)
+        responses.add(responses.GET, f"{MIRROR}/{DOI}", body=captcha_html, status=200)
+        responses.add(
+            responses.GET, f"{MIRROR}/captcha/challenge/12345", json=chal, status=200
+        )
+        responses.add(
+            responses.POST,
+            f"{MIRROR}/captcha/solution/12345",
+            json={"success": False},
+            status=200,
+        )
+        with pytest.raises(ChallengeError):
+            ScihubClient(mirrors=[MIRROR], retries=0).resolve(DOI)

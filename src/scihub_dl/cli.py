@@ -21,7 +21,7 @@ from rich.table import Table
 from . import __version__
 from .batch import BatchDownloader, summarize, write_manifest
 from .client import DEFAULT_MIRRORS, ScihubClient
-from .errors import InvalidDOIError, ScihubError
+from .errors import InvalidDOIError, NotFoundError, ParseError, ScihubError
 from .models import BatchResult
 from .utils import normalize_doi, read_dois_file
 
@@ -31,6 +31,7 @@ err_console = Console(stderr=True)
 STATUS_STYLE = {
     "ok": "green",
     "not_found": "yellow",
+    "parse_error": "magenta",
     "error": "red",
     "skipped": "dim",
 }
@@ -326,18 +327,32 @@ def batch(
         table.add_column("Total", justify="right")
         table.add_column("OK", justify="right", style="green")
         table.add_column("Not found", justify="right", style="yellow")
+        # Shown separately from "Not found": an unparseable page means we could
+        # not read it, not that the paper is unavailable. Merging the two would
+        # under-report totals and hide false negatives.
+        table.add_column("Unresolved", justify="right", style="magenta")
         table.add_column("Errors", justify="right", style="red")
         table.add_column("Downloaded", justify="right")
         table.add_row(
             str(stats["total"]),
             str(stats["ok"]),
             str(stats["not_found"]),
+            str(stats["parse_errors"]),
             str(stats["errors"]),
             _human_size(stats["downloaded_bytes"]),
         )
         console.print(table)
 
-    if fail_fast and (stats["errors"] or stats["not_found"]):
+        if stats["parse_errors"]:
+            console.print(
+                f"[magenta]Note:[/magenta] {stats['parse_errors']} DOI(s) could not be "
+                "resolved to a PDF link. This is not proof they are unavailable - "
+                "retry later or try another --mirror."
+            )
+
+    if fail_fast and (
+        stats["errors"] or stats["not_found"] or stats["parse_errors"]
+    ):
         sys.exit(1)
     if stats["ok"] == 0 and stats["total"] > 0:
         sys.exit(1)

@@ -224,9 +224,22 @@ class TestSummarize:
             "total": 4,
             "ok": 2,
             "not_found": 1,
+            "parse_errors": 0,
             "errors": 1,
             "downloaded_bytes": 300,
         }
+
+    def test_parse_errors_counted_separately_from_not_found(self):
+        """A page we could not read must never be reported as 'absent'."""
+        results = [
+            BatchResult(doi="a", status="not_found"),
+            BatchResult(doi="b", status="parse_error", error="layout changed"),
+            BatchResult(doi="c", status="parse_error", error="layout changed"),
+        ]
+        s = summarize(results)
+        assert s["not_found"] == 1
+        assert s["parse_errors"] == 2
+        assert s["ok"] == 0
 
     def test_empty(self):
         assert summarize([])["total"] == 0

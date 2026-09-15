@@ -21,11 +21,14 @@ vary - see the README.
 from .batch import BatchDownloader, summarize, write_manifest
 from .client import DEFAULT_MIRRORS, ScihubClient
 from .errors import (
+    BotCheckError,
     ChallengeError,
     DownloadError,
     InvalidDOIError,
     MirrorUnreachableError,
     NotFoundError,
+    ParseError,
+    RedirectLoopError,
     ScihubError,
 )
 from .models import BatchResult, Paper
@@ -47,8 +50,11 @@ __all__ = [
     "read_dois_file",
     "ScihubError",
     "MirrorUnreachableError",
+    "RedirectLoopError",
+    "BotCheckError",
     "ChallengeError",
     "NotFoundError",
+    "ParseError",
     "InvalidDOIError",
     "DownloadError",
     "__version__",

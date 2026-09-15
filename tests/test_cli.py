@@ -275,6 +275,49 @@ class TestBatch:
         assert data["results"][0]["pdf_url"] == PDF1
         assert list(tmp_path.glob("*.pdf")) == []
 
+    @responses.activate
+    def test_batch_summary_accounts_for_every_doi(self, runner, tmp_path):
+        """Regression: parse_error rows were missing from the summary table,
+        so OK + not_found + errors silently failed to add up to Total."""
+        _mirror_up()
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI1}",
+            body=paper_page("Paper One", "A", "2013", PDF1),
+            status=200,
+        )
+        responses.add(responses.GET, PDF1, body=PDF_BYTES, status=200)
+        # A page that loads but exposes no PDF link -> parse_error.
+        responses.add(
+            responses.GET,
+            f"{MIRROR}/{DOI2}",
+            body="<html><body>" + ("filler " * 5000) + "</body></html>",
+            status=200,
+        )
+
+        res = runner.invoke(
+            main,
+            [
+                "batch",
+                DOI1,
+                DOI2,
+                "-o",
+                str(tmp_path),
+                "--json",
+                "--mirror",
+                MIRROR,
+                "--delay",
+                "0",
+            ],
+        )
+        data = json.loads(res.output)
+        s = data["summary"]
+        assert s["total"] == 2
+        assert s["ok"] == 1
+        assert s["parse_errors"] == 1
+        # Every DOI must land in exactly one bucket.
+        assert s["ok"] + s["not_found"] + s["parse_errors"] + s["errors"] == s["total"]
+
     def test_batch_no_dois_exits_2(self, runner, tmp_path):
         res = runner.invoke(
             main, ["batch", "-o", str(tmp_path), "--mirror", MIRROR], input=""

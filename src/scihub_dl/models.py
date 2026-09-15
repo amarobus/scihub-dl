@@ -42,7 +42,13 @@ class BatchResult:
     """Outcome of a single DOI within a batch run."""
 
     doi: str
-    status: str  # "ok" | "not_found" | "error" | "skipped"
+    # "ok"          - downloaded / resolved
+    # "not_found"   - Sci-Hub affirmatively reports the document is absent
+    # "parse_error" - page loaded but no PDF link could be extracted
+    #                 (NOT evidence of absence; likely a layout change)
+    # "error"       - transport/mirror/captcha failure
+    # "skipped"     - intentionally not attempted
+    status: str
     path: Optional[str] = None
     size: Optional[int] = None
     title: Optional[str] = None
